@@ -30,6 +30,7 @@ const provider: GenericProviderDefinition<{
           };
         },
       },
+      pkce: false,
       providerId: 'casdoor',
     }),
   checkEnvs: () => {
