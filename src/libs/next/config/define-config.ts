@@ -7,6 +7,7 @@ import { dockerCanvasTracingIncludes } from './dockerCanvasTracingIncludes';
 const LANDING_SITEMAP_URL = 'https://lobehub.com/sitemap.xml';
 
 interface CustomNextConfig {
+  allowedDevOrigins?: NextConfig['allowedDevOrigins'];
   experimental?: NextConfig['experimental'];
   headers?: Header[];
   outputFileTracingExcludes?: NextConfig['outputFileTracingExcludes'];
@@ -60,6 +61,7 @@ export function defineConfig(config: CustomNextConfig) {
 
   const nextConfig: NextConfig = {
     ...(isStandaloneMode ? standaloneConfig : {}),
+    allowedDevOrigins: config.allowedDevOrigins,
     assetPrefix,
 
     compiler: {

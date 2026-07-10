@@ -21,6 +21,7 @@ const vercelConfig = {
 };
 const nextConfig = defineConfig({
   ...(isVercel ? vercelConfig : {}),
+  allowedDevOrigins: ['chat.adorable0v0.top', '123.235.23.38'],
 });
 
 export default nextConfig;
