@@ -383,6 +383,17 @@ export function defineConfig(config: CustomNextConfig) {
       ...config.turbopack,
     },
 
+    ...(process.platform === 'win32'
+      ? {
+          webpack: (webpackConfig, { webpack }) => {
+            webpackConfig.module.rules.push({ test: /\.md$/, use: 'raw-loader' });
+            webpackConfig.plugins.push(new webpack.IgnorePlugin({ resourceRegExp: /^zlib-sync$/ }));
+
+            return webpackConfig;
+          },
+        }
+      : {}),
+
     typescript: {
       ignoreBuildErrors: true,
     },
