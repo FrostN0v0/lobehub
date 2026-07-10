@@ -6,20 +6,81 @@ import {
   type DropdownItem,
   DropdownMenu,
   Flexbox,
+  Markdown,
+  MaskShadow,
   stopPropagation,
+  Tag,
   Text,
 } from '@lobehub/ui';
-import { cssVar } from 'antd-style';
-import dayjs from 'dayjs';
-import { CircleDot, Copy, ExternalLink, MoreHorizontal } from 'lucide-react';
-import { memo, useCallback, useEffect, useState } from 'react';
+import { Button, confirmModal } from '@lobehub/ui/base-ui';
+import { useSize } from 'ahooks';
+import { createStaticStyles, cssVar } from 'antd-style';
+import {
+  ChevronDownIcon,
+  ChevronUpIcon,
+  CircleDot,
+  CircleStop,
+  Copy,
+  ExternalLink,
+  MoreHorizontal,
+  SquarePen,
+} from 'lucide-react';
+import { memo, useCallback, useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
 import AgentProfilePopup from '@/features/AgentProfileCard/AgentProfilePopup';
+import { useActivityTime } from '@/hooks/useActivityTime';
+import { usePermission } from '@/hooks/usePermission';
 import { useTaskStore } from '@/store/task';
+import { taskDetailSelectors } from '@/store/task/selectors';
 
 import { styles } from '../shared/style';
+import RunReplyEditor from './RunReplyEditor';
 import TopicStatusIcon from './TopicStatusIcon';
+
+const runContentStyles = createStaticStyles(({ css, cssVar }) => ({
+  clipInner: css`
+    padding-block-end: 36px;
+  `,
+  container: css`
+    position: relative;
+    width: 100%;
+  `,
+  toggleButton: css`
+    pointer-events: auto;
+
+    height: 28px;
+    padding-inline: 10px;
+    border-color: transparent;
+    border-radius: 999px;
+
+    color: ${cssVar.colorTextSecondary};
+
+    background: ${cssVar.colorFillQuaternary};
+
+    &:focus-visible,
+    &:hover:not(:disabled, [aria-disabled='true']) {
+      color: ${cssVar.colorText};
+      background: ${cssVar.colorFillTertiary};
+    }
+  `,
+  toggleFloating: css`
+    pointer-events: none;
+
+    position: absolute;
+    z-index: 1;
+    inset-block-end: 4px;
+    inset-inline: 0;
+
+    display: flex;
+    justify-content: center;
+  `,
+  toggleInline: css`
+    display: flex;
+    justify-content: center;
+    margin-block-start: 4px;
+  `,
+}));
 
 const formatDuration = (ms: number): string => {
   const seconds = Math.floor(ms / 1000);
@@ -30,6 +91,69 @@ const formatDuration = (ms: number): string => {
   return `${hours}h ${minutes % 60}m`;
 };
 
+// The run's last message (`content`) is the raw assistant output — markdown, and
+// often long. Render it as rich text, but keep it a bounded preview in the feed:
+// clamp overflow with a fade, offer an inline expand affordance, and still let
+// the whole card open the run drawer for deeper reading. `pointerEvents: none`
+// keeps every click inside markdown falling through to the card.
+const RUN_CONTENT_MAX_HEIGHT = 160;
+
+const RunContent = memo<{ content: string }>(({ content }) => {
+  const { t } = useTranslation('chat');
+  const ref = useRef<HTMLDivElement>(null);
+  const size = useSize(ref);
+  const [expanded, setExpanded] = useState(false);
+  const isOverflow = !!size && size.height > RUN_CONTENT_MAX_HEIGHT;
+
+  useEffect(() => {
+    setExpanded(false);
+  }, [content]);
+
+  const markdown = (
+    <Markdown ref={ref} style={{ overflow: 'unset', pointerEvents: 'none' }} variant={'chat'}>
+      {content}
+    </Markdown>
+  );
+
+  if (!isOverflow) return markdown;
+
+  const toggleButton = (
+    <Button
+      aria-expanded={expanded}
+      className={runContentStyles.toggleButton}
+      icon={expanded ? <ChevronUpIcon size={14} /> : <ChevronDownIcon size={14} />}
+      shape={'round'}
+      size={'small'}
+      type={'fill'}
+      onClick={() => setExpanded((value) => !value)}
+    >
+      {expanded ? t('messageLongCollapse.collapse') : t('messageLongCollapse.expand')}
+    </Button>
+  );
+
+  if (expanded) {
+    return (
+      <div className={runContentStyles.container}>
+        {markdown}
+        <div className={runContentStyles.toggleInline} onClick={stopPropagation}>
+          {toggleButton}
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className={runContentStyles.container}>
+      <MaskShadow size={40} style={{ maxHeight: RUN_CONTENT_MAX_HEIGHT }}>
+        <div className={runContentStyles.clipInner}>{markdown}</div>
+      </MaskShadow>
+      <div className={runContentStyles.toggleFloating} onClick={stopPropagation}>
+        {toggleButton}
+      </div>
+    </div>
+  );
+});
+
 interface TopicCardProps {
   activity: TaskDetailActivity;
 }
@@ -37,7 +161,18 @@ interface TopicCardProps {
 const TopicCard = memo<TopicCardProps>(({ activity }) => {
   const { t } = useTranslation('chat');
   const openTopicDrawer = useTaskStore((s) => s.openTopicDrawer);
+  const cancelTopic = useTaskStore((s) => s.cancelTopic);
+  const addComment = useTaskStore((s) => s.addComment);
+  const activeTaskId = useTaskStore(taskDetailSelectors.activeTaskId);
+  const { allowed: canEditTask } = usePermission('create_content');
+  const [commenting, setCommenting] = useState(false);
   const isRunning = activity.status === 'running';
+  // A descendant run shown in a parent detail belongs to `sourceTaskId`, not the
+  // currently open parent (`activeTaskId`) — file the follow-up on the task that
+  // owns the run so it appears where the run lives. Direct runs fall back to the
+  // active task.
+  const runTaskId = activity.sourceTaskId ?? activeTaskId;
+  const canFollowUp = canEditTask && !!runTaskId;
 
   const finalDuration =
     !isRunning && activity.time && activity.completedAt
@@ -68,7 +203,24 @@ const TopicCard = memo<TopicCardProps>(({ activity }) => {
     if (activity.operationId) void navigator.clipboard.writeText(activity.operationId);
   }, [activity.operationId]);
 
-  const startedAt = activity.time ? dayjs(activity.time).fromNow() : '';
+  const handleStop = useCallback(() => {
+    if (!activity.id) return;
+    const topicId = activity.id;
+    confirmModal({
+      cancelText: t('cancel', { ns: 'common' }),
+      content: t('taskDetail.topicMenu.stopConfirm.content', {
+        defaultValue:
+          'The current run will be canceled. Generated messages are kept and you can re-run the task later.',
+      }),
+      okText: t('taskDetail.topicMenu.stop', { defaultValue: 'Stop Run' }),
+      onOk: async () => {
+        await cancelTopic(topicId);
+      },
+      title: t('taskDetail.topicMenu.stopConfirm.title', { defaultValue: 'Stop Run?' }),
+    });
+  }, [activity.id, cancelTopic, t]);
+
+  const { text: startedAt, title: startedAtTitle } = useActivityTime(activity.time);
   const durationText = isRunning
     ? formatDuration(elapsed)
     : finalDuration != null && finalDuration >= 0
@@ -76,24 +228,36 @@ const TopicCard = memo<TopicCardProps>(({ activity }) => {
       : '';
 
   const menuItems: DropdownItem[] = [
+    ...(isRunning && activity.id
+      ? [
+          {
+            danger: true,
+            icon: CircleStop,
+            key: 'stop',
+            label: t('taskDetail.topicMenu.stop', { defaultValue: 'Stop Run' }),
+            onClick: handleStop,
+          },
+          { type: 'divider' as const },
+        ]
+      : []),
     {
       icon: ExternalLink,
       key: 'open',
-      label: t('taskDetail.topicMenu.open', { defaultValue: 'Open run' }),
+      label: t('taskDetail.topicMenu.open', { defaultValue: 'Open Run' }),
       onClick: handleOpen,
     },
     {
       disabled: !activity.id,
       icon: Copy,
       key: 'copy',
-      label: t('taskDetail.topicMenu.copyId', { defaultValue: 'Copy topic ID' }),
+      label: t('taskDetail.topicMenu.copyId', { defaultValue: 'Copy Topic ID' }),
       onClick: handleCopyId,
     },
     {
       disabled: !activity.operationId,
       icon: Copy,
       key: 'copyOperationId',
-      label: t('taskDetail.topicMenu.copyOperationId', { defaultValue: 'Copy operation ID' }),
+      label: t('taskDetail.topicMenu.copyOperationId', { defaultValue: 'Copy Operation ID' }),
       onClick: handleCopyOperationId,
     },
   ];
@@ -132,6 +296,15 @@ const TopicCard = memo<TopicCardProps>(({ activity }) => {
             avatarNode
           )}
           <TopicStatusIcon size={16} status={activity.status} />
+          {activity.sourceTaskIdentifier && (
+            <Tag
+              size={'small'}
+              style={{ flexShrink: 0 }}
+              title={t('taskDetail.topicSource', { identifier: activity.sourceTaskIdentifier })}
+            >
+              {activity.sourceTaskIdentifier}
+            </Tag>
+          )}
           <Text ellipsis weight={500}>
             {activity.title}
           </Text>
@@ -149,7 +322,7 @@ const TopicCard = memo<TopicCardProps>(({ activity }) => {
 
         <Flexbox horizontal align={'center'} flex={'none'} gap={8}>
           {startedAt && (
-            <Text fontSize={12} type={'secondary'}>
+            <Text fontSize={12} title={startedAtTitle} type={'secondary'}>
               {startedAt}
             </Text>
           )}
@@ -161,10 +334,39 @@ const TopicCard = memo<TopicCardProps>(({ activity }) => {
         </Flexbox>
       </Flexbox>
 
-      {activity.summary && (
-        <Text fontSize={13} style={{ color: cssVar.colorTextSecondary, whiteSpace: 'pre-wrap' }}>
-          {activity.summary}
-        </Text>
+      {(activity.summary || activity.content || canFollowUp) && (
+        <Flexbox gap={8} paddingInline={4}>
+          {activity.summary && (
+            <Text
+              fontSize={13}
+              style={{ color: cssVar.colorTextDescription, whiteSpace: 'pre-wrap' }}
+            >
+              {activity.summary}
+            </Text>
+          )}
+          {activity.content && <RunContent content={activity.content} />}
+          {canFollowUp &&
+            (commenting ? (
+              <Flexbox onClick={stopPropagation}>
+                <RunReplyEditor
+                  onCancel={() => setCommenting(false)}
+                  onSubmit={async (text) => {
+                    await addComment(runTaskId!, text, { topicId: activity.id });
+                    setCommenting(false);
+                  }}
+                />
+              </Flexbox>
+            ) : (
+              <Flexbox horizontal justify={'flex-end'} onClick={stopPropagation}>
+                <ActionIcon
+                  icon={SquarePen}
+                  size={'small'}
+                  title={t('taskDetail.runFollowUp')}
+                  onClick={() => setCommenting(true)}
+                />
+              </Flexbox>
+            ))}
+        </Flexbox>
       )}
     </Block>
   );

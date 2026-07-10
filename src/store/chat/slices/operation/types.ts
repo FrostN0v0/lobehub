@@ -1,4 +1,4 @@
-import { type ConversationContext } from '@lobechat/types';
+import type { ConversationContext, MessageMetadata, UploadFileItem } from '@lobechat/types';
 
 /**
  * Operation Type Definitions
@@ -14,6 +14,7 @@ export type OperationType =
   | 'createTopic' // Auto create topic
   | 'regenerate' // Regenerate message
   | 'continue' // Continue generation
+  | 'autoRetryPending' // Heterogeneous "overloaded" auto-retry waiting period (counting down to the next attempt). Keeps the turn in a loading/in-progress state between attempts; cancelled by Stop or the guide's cancel action.
 
   // === AI generation ===
   | 'execAgentRuntime' // Execute agent runtime (client-side, entire agent runtime execution)
@@ -57,9 +58,9 @@ export type OperationType =
   | 'groupAgentGenerate' // Group agent generate (deprecated, use groupAgentStream)
   | 'groupAgentStream' // Group agent SSE stream (sub-operation of execServerAgentRuntime)
 
-  // === Async Task (Desktop only) ===
-  | 'execClientTask' // Execute single async sub-agent task on desktop client
-  | 'execClientTasks' // Execute multiple async sub-agent tasks on desktop client
+  // === Sub-Agent (Desktop only) ===
+  | 'execClientSubAgent' // Dispatch single sub-agent on the desktop client
+  | 'execClientSubAgents' // Dispatch multiple sub-agents on the desktop client
 
   // === Context Compression ===
   // Context compression (compress old messages into summary)
@@ -148,12 +149,18 @@ export interface OperationMetadata {
     total: number;
     percentage?: number;
   };
-
   // Runtime hooks (collected during execution, executed after completion)
   runtimeHooks?: RuntimeHooks;
 
   // Performance information
   startTime: number;
+
+  /**
+   * The model text stream has finished and there is no visible follow-up phase
+   * to wait for, but the runtime operation still needs its terminal lifecycle
+   * (`agent_runtime_end`) for cache, queue, unread, and notification effects.
+   */
+  visibleLoadingDone?: boolean;
 }
 
 /**
@@ -187,6 +194,41 @@ export interface Operation {
 }
 
 /**
+ * Per-file preview metadata snapshotted at enqueue time so the queue tray can
+ * render thumbnails and the resumed sendMessage can rebuild the optimistic
+ * imageList/videoList without relying on the global chat upload store (which
+ * is cleared as soon as the user submits).
+ */
+export interface QueuedFile {
+  id: string;
+  /** MIME type, e.g. `image/png`, `video/mp4`, `application/pdf` */
+  mimeType: string;
+  name: string;
+  /** Preview URL — S3 URL for uploaded files, blob/base64 for in-memory items */
+  url: string;
+}
+
+/**
+ * Rebuild `UploadFileItem`-shaped objects from queued previews so the resumed
+ * `sendMessage` can derive imageList/videoList AND so we can repopulate
+ * `chatUploadFileList` when the user edits a queued message. The synthesized
+ * `File` carries only `name` + `type` (zero bytes) — the consumers we hit only
+ * read `file.name`, `file.type`, plus the URL fields we set below.
+ *
+ * We mirror the snapshotted `url` into both `fileUrl` and `previewUrl`: the
+ * optimistic-message path uses the `fileUrl || base64Url || previewUrl` fallback
+ * chain, while the desktop chat-input file preview only reads `previewUrl`.
+ */
+export const reconstructUploadFilesFromQueue = (files: QueuedFile[]): UploadFileItem[] =>
+  files.map((f) => ({
+    id: f.id,
+    file: new File([], f.name, { type: f.mimeType }),
+    fileUrl: f.url || undefined,
+    previewUrl: f.url || undefined,
+    status: 'success',
+  }));
+
+/**
  * Queued message waiting to be injected into agent runtime
  */
 export interface QueuedMessage {
@@ -195,8 +237,14 @@ export interface QueuedMessage {
   /** Lexical editor JSON state for rich text rendering */
   editorData?: Record<string, any>;
   files?: string[];
+  /** Snapshot of file previews (id, name, mime, url) for tray rendering and optimistic resume */
+  filesPreview?: QueuedFile[];
+  /** Mirrors SendMessageParams.forceRuntime so a queued task-topic follow-up
+   *  keeps its gateway pin when the queue drains. */
+  forceRuntime?: 'client' | 'gateway' | 'hetero';
   id: string;
   interruptMode: 'soft' | 'hard';
+  metadata?: MessageMetadata;
 }
 
 /**
@@ -207,6 +255,9 @@ export interface MergedQueuedMessage {
   /** Lexical editor JSON state for rich text rendering */
   editorData?: Record<string, any>;
   files: string[];
+  filesPreview: QueuedFile[];
+  forceRuntime?: 'client' | 'gateway' | 'hetero';
+  metadata?: MessageMetadata;
 }
 
 const createTextNode = (text: string) => ({
@@ -289,10 +340,41 @@ const mergeQueuedEditorData = (messages: QueuedMessage[]): Record<string, any> |
  */
 export const mergeQueuedMessages = (messages: QueuedMessage[]): MergedQueuedMessage => {
   const sorted = [...messages].sort((a, b) => a.createdAt - b.createdAt);
+  const metadata = sorted.reduce<MessageMetadata | undefined>((acc, message) => {
+    if (!message.metadata) return acc;
+    const localSystemToolSnapshots = [
+      ...(acc?.localSystemToolSnapshots ?? []),
+      ...(message.metadata.localSystemToolSnapshots ?? []),
+    ];
+    const pageSelections = [
+      ...(acc?.pageSelections ?? []),
+      ...(message.metadata.pageSelections ?? []),
+    ];
+    const contextSelections = [
+      ...(acc?.contextSelections ?? []),
+      ...(message.metadata.contextSelections ?? []),
+    ];
+
+    return {
+      ...acc,
+      ...message.metadata,
+      ...(localSystemToolSnapshots.length ? { localSystemToolSnapshots } : undefined),
+      ...(contextSelections.length ? { contextSelections } : undefined),
+      ...(pageSelections.length ? { pageSelections } : undefined),
+    };
+  }, undefined);
+
+  // If any queued message pins the runtime, propagate it — a "server topic"
+  // follow-up must stay on its rails even after merge.
+  const forceRuntime = sorted.find((m) => m.forceRuntime)?.forceRuntime;
+
   return {
     content: sorted.map((m) => m.content).join('\n\n'),
     editorData: mergeQueuedEditorData(sorted),
     files: sorted.flatMap((m) => m.files ?? []),
+    filesPreview: sorted.flatMap((m) => m.filesPreview ?? []),
+    ...(forceRuntime ? { forceRuntime } : {}),
+    metadata,
   };
 };
 
@@ -327,6 +409,29 @@ export const AI_RUNTIME_OPERATION_TYPES: OperationType[] = [
 ];
 
 /**
+ * Interim operations that approve / submit / skip / regenerate each start
+ * synchronously on click, before the whitelisted `execServerAgentRuntime` op is
+ * created 2–4 serial tRPC round-trips later. The interim op stays running until
+ * `executeGatewayAgent` spins up the runtime op, so it bridges the pre-generation
+ * window seamlessly.
+ *
+ * Shared by two whitelists so the whole window behaves consistently:
+ * - INPUT_LOADING_OPERATION_TYPES — show input loading/Stop the instant the user clicks.
+ * - QUEUE_BLOCKING_OPERATION_TYPES — a fast follow-up Enter queues behind the interim
+ *   op instead of starting a concurrent `sendMessage` that interleaves with the
+ *   approve/retry flow before the real runtime op exists.
+ *
+ * Kept out of AI_RUNTIME_OPERATION_TYPES on purpose to avoid flipping
+ * isAgentRuntimeRunning / isMessageGenerating and their gating logic.
+ */
+export const INTERIM_LOADING_OPERATION_TYPES: OperationType[] = [
+  'approveToolCalling',
+  'submitToolInteraction',
+  'skipToolInteraction',
+  'regenerate',
+];
+
+/**
  * Operation types that should block input and show loading state
  * Superset of AI_RUNTIME_OPERATION_TYPES, also includes sendMessage
  * since the input should be in loading state from the moment user sends until AI finishes
@@ -334,4 +439,35 @@ export const AI_RUNTIME_OPERATION_TYPES: OperationType[] = [
 export const INPUT_LOADING_OPERATION_TYPES: OperationType[] = [
   ...AI_RUNTIME_OPERATION_TYPES,
   'sendMessage',
+  // The auto-retry waiting period is part of the same in-progress turn — keep
+  // the input in loading state (and let Stop target it) across the countdown.
+  'autoRetryPending',
+  // Interim approve/submit/skip/regenerate ops light up the input the instant
+  // the user clicks, mirroring how `sendMessage` already does — instead of only
+  // after the round-trips. See INTERIM_LOADING_OPERATION_TYPES for the bridge
+  // semantics and why they stay out of AI_RUNTIME_OPERATION_TYPES.
+  //
+  // Known limitation (accepted): this also makes Stop appear during the pre-
+  // generation window. Because these gateway branches don't forward
+  // `parentOperationId` to `executeGatewayAgent`, hitting Stop in that narrow
+  // window doesn't actually abort the in-flight request (loading briefly
+  // flickers, generation proceeds). No stuck state; wiring the abort handoff
+  // through these branches is deferred.
+  ...INTERIM_LOADING_OPERATION_TYPES,
+];
+
+/**
+ * Operation types that block a fresh `sendMessage`: a send fired while one of
+ * these runs enqueues behind it instead of starting a concurrent run.
+ *
+ * Single source of truth shared by the enqueue check (conversationLifecycle) and
+ * the QueueTray "Send now" cancel path — so both agree on what a follow-up is
+ * queued behind. Kept in sync with INPUT_LOADING via the shared
+ * INTERIM_LOADING_OPERATION_TYPES: if the input shows loading for an op, a
+ * follow-up must queue behind it, and "Send now" must be able to cancel it.
+ */
+export const QUEUE_BLOCKING_OPERATION_TYPES: OperationType[] = [
+  ...AI_RUNTIME_OPERATION_TYPES,
+  'sendMessage',
+  ...INTERIM_LOADING_OPERATION_TYPES,
 ];

@@ -1,16 +1,20 @@
-import type { TaskDetailData } from '@lobechat/types';
+import type { TaskDetailData, TaskDetailSubtask } from '@lobechat/types';
 import isEqual from 'fast-deep-equal';
 import { t } from 'i18next';
 
 import { message } from '@/components/AntdStaticMethods';
 import { mutate, useClientDataSWR } from '@/libs/swr';
+import { taskKeys } from '@/libs/swr/keys';
 import { taskService } from '@/services/task';
 import type { StoreSetter } from '@/store/types';
+import { runMutation } from '@/store/utils/runMutation';
+import { saveToast } from '@/store/utils/saveToast';
+import type { SaveStatus } from '@/types/saveState';
 
 import type { TaskStore } from '../../store';
 import { useTaskStore } from '../../store';
 import type { TaskDetailDispatch } from './reducer';
-import { taskDetailReducer } from './reducer';
+import { findSubtaskParentId, taskDetailReducer } from './reducer';
 
 type CreatedTask = NonNullable<Awaited<ReturnType<typeof taskService.create>>['data']>;
 type DeletedTask = NonNullable<Awaited<ReturnType<typeof taskService.delete>>['data']>;
@@ -19,17 +23,27 @@ type DeletedTask = NonNullable<Awaited<ReturnType<typeof taskService.delete>>['d
 // - model/provider goes through configSlice.updateTaskModelConfig
 // - checkpoint goes through configSlice.updateCheckpoint
 // - review goes through configSlice.updateReview
-// - heartbeat config will get a dedicated action once the upstream infra in LOBE-6587 is complete
+// - heartbeat config will get a dedicated action once the upstream task scheduler infra is complete
 export interface TaskUpdatePayload {
   assigneeAgentId?: string | null;
   description?: string;
+  editorData?: unknown;
   instruction?: string;
   name?: string;
+  parentTaskId?: string | null;
   priority?: number;
 }
 
-const FETCH_TASK_DETAIL_KEY = 'fetchTaskDetail';
 const TASK_DETAIL_POLL_INTERVAL = 10_000;
+
+const hasInFlightSubtask = (subtasks: TaskDetailSubtask[] | undefined): boolean =>
+  subtasks?.some(
+    (subtask) =>
+      Boolean(subtask.runningTopic) ||
+      subtask.status === 'running' ||
+      subtask.status === 'pending' ||
+      hasInFlightSubtask(subtask.children),
+  ) ?? false;
 
 // Poll while the task itself or any topic activity is still in flight, so the
 // UI picks up status transitions (running → completed/failed) without needing
@@ -37,6 +51,7 @@ const TASK_DETAIL_POLL_INTERVAL = 10_000;
 const hasInFlightActivity = (detail: TaskDetailData | undefined): boolean => {
   if (!detail) return false;
   if (detail.status === 'running' || detail.status === 'pending') return true;
+  if (hasInFlightSubtask(detail.subtasks)) return true;
   return (
     detail.activities?.some(
       (a) => a.type === 'topic' && (a.status === 'running' || a.status === 'pending'),
@@ -64,10 +79,16 @@ export class TaskDetailSliceActionImpl {
   addComment = async (
     taskId: string,
     content: string,
-    opts?: { briefId?: string; topicId?: string },
-  ): Promise<void> => {
-    await taskService.addComment(taskId, content, opts);
+    opts?: {
+      authorAgentId?: string;
+      briefId?: string;
+      editorData?: unknown;
+      topicId?: string;
+    },
+  ): Promise<Awaited<ReturnType<typeof taskService.addComment>>> => {
+    const result = await taskService.addComment(taskId, content, opts);
     await this.internal_refreshTaskDetail(taskId);
+    return result;
   };
 
   deleteComment = async (commentId: string, taskId?: string): Promise<void> => {
@@ -76,8 +97,13 @@ export class TaskDetailSliceActionImpl {
     if (id) await this.internal_refreshTaskDetail(id);
   };
 
-  updateComment = async (commentId: string, content: string, taskId?: string): Promise<void> => {
-    await taskService.updateComment(commentId, content);
+  updateComment = async (
+    commentId: string,
+    content: string,
+    opts?: { editorData?: unknown; taskId?: string },
+  ): Promise<void> => {
+    const { taskId, ...rest } = opts ?? {};
+    await taskService.updateComment(commentId, content, rest);
     const id = taskId ?? this.#get().activeTaskId;
     if (id) await this.internal_refreshTaskDetail(id);
   };
@@ -102,7 +128,13 @@ export class TaskDetailSliceActionImpl {
     const detail = result.data;
 
     if (!detail) {
-      throw new Error(`Task not found: ${resolvedId}`);
+      // Mark the *resolved* not-found so the read side can tell it apart from a
+      // network / 500 rejection (which propagates from `taskService.getDetail`
+      // above with an HTTP status). Without this tag both would render the same
+      // terminal 404, telling the user a merely-errored task was deleted.
+      const notFound = new Error(`Task not found: ${resolvedId}`) as Error & { code?: string };
+      notFound.code = 'TASK_NOT_FOUND';
+      throw notFound;
     }
 
     this.internal_dispatchTaskDetail({
@@ -126,12 +158,17 @@ export class TaskDetailSliceActionImpl {
 
   createTask = async (params: {
     assigneeAgentId?: string;
+    automationMode?: 'heartbeat' | 'schedule';
     createdByAgentId?: string;
     description?: string;
+    editorData?: unknown;
     instruction: string;
     name?: string;
     parentTaskId?: string;
     priority?: number;
+    schedulePattern?: string;
+    scheduleTimezone?: string;
+    visibility?: 'private' | 'public';
   }): Promise<CreatedTask | null> => {
     this.#set({ isCreatingTask: true }, false, 'createTask/start');
     try {
@@ -193,7 +230,6 @@ export class TaskDetailSliceActionImpl {
     if (this.#get().activeTaskId === taskId) return;
     this.#set(
       {
-        activePageModalId: undefined,
         activeTaskId: taskId,
         activeTopicDrawerTopicId: undefined,
       },
@@ -212,20 +248,6 @@ export class TaskDetailSliceActionImpl {
     this.#set({ activeTopicDrawerTopicId: undefined }, false, 'closeTopicDrawer');
   };
 
-  openPageModal = (pageId: string): void => {
-    if (this.#get().activePageModalId === pageId) return;
-    this.#set(
-      { activePageModalId: pageId, activeTopicDrawerTopicId: undefined },
-      false,
-      'openPageModal',
-    );
-  };
-
-  closePageModal = (): void => {
-    if (!this.#get().activePageModalId) return;
-    this.#set({ activePageModalId: undefined }, false, 'closePageModal');
-  };
-
   unpinDocument = async (taskId: string, documentId: string): Promise<void> => {
     await taskService.unpinDocument(taskId, documentId);
     // taskId here is the source (owning) task — may be a descendant of the
@@ -238,32 +260,73 @@ export class TaskDetailSliceActionImpl {
     }
   };
 
-  updateTask = async (id: string, data: TaskUpdatePayload): Promise<void> => {
-    const { assigneeAgentId, ...rest } = data;
-    const optimistic: Partial<TaskDetailData> = {
-      ...rest,
-      ...(assigneeAgentId !== undefined ? { agentId: assigneeAgentId } : {}),
-    };
-    this.internal_dispatchTaskDetail({ id, type: 'updateTaskDetail', value: optimistic });
-    this.#set({ taskSaveStatus: 'saving' }, false, 'updateTask/saving');
-
+  updateTaskVisibility = async (id: string, visibility: 'private' | 'public'): Promise<void> => {
     try {
-      await taskService.update(id, data);
-      this.#set({ taskSaveStatus: 'saved' }, false, 'updateTask/saved');
-      if (assigneeAgentId !== undefined) {
-        await this.#get().refreshTaskList();
-      }
+      await taskService.updateVisibility(id, visibility);
+      await Promise.all([this.#get().refreshTaskList(), this.internal_refreshTaskDetail(id)]);
     } catch (error) {
-      this.#set({ taskSaveStatus: 'idle' }, false, 'updateTask/error');
-      // Revert by refreshing from server
-      await this.internal_refreshTaskDetail(id);
+      // Surfaces a specific actionable error when the task's assignee is a
+      // private agent. The generic "failed" toast hides what the user must
+      // do next; substitute a targeted one so they know to either reassign
+      // or publish the agent first.
+      const raw = (error as { message?: string })?.message ?? '';
+      const isPrivateAgentBlock = /public task cannot be assigned to a private agent/i.test(raw);
       message.error(
-        t('taskDetail.updateFailed', {
-          defaultValue: 'Failed to update task',
-          ns: 'chat',
-        }),
+        isPrivateAgentBlock
+          ? t('taskDetail.publishToWorkspace.errorPrivateAgent', {
+              defaultValue:
+                'This task is assigned to a private agent. Reassign to a workspace agent, or publish the agent first.',
+              ns: 'chat',
+            })
+          : t('createTask.visibility.changeFailed', {
+              defaultValue: 'Failed to change task visibility',
+              ns: 'chat',
+            }),
       );
       throw error;
+    }
+  };
+
+  updateTask = async (id: string, data: TaskUpdatePayload): Promise<void> => {
+    const { assigneeAgentId, ...rest } = data;
+    const optimisticRest = { ...rest };
+    delete optimisticRest.parentTaskId;
+    const optimistic: Partial<TaskDetailData> = {
+      ...optimisticRest,
+      ...(assigneeAgentId !== undefined ? { agentId: assigneeAgentId } : {}),
+    };
+
+    // Snapshot every map entry the optimistic patch will touch BEFORE dispatch.
+    // activeTaskId can change mid-flight, and the patch can mutate a parent's
+    // cached subtree in addition to `id`, so rollback must target both.
+    const patchedParentId = findSubtaskParentId(this.#get().taskDetailMap, id);
+    const snapshotActiveTaskId = this.#get().activeTaskId;
+    const refreshPatchedTargets = async (): Promise<void> => {
+      const targets = new Set<string>([id]);
+      if (patchedParentId) targets.add(patchedParentId);
+      if (data.parentTaskId) targets.add(data.parentTaskId);
+      if (snapshotActiveTaskId) targets.add(snapshotActiveTaskId);
+      await Promise.all(
+        Array.from(targets).map((target) => this.internal_refreshTaskDetail(target)),
+      );
+    };
+
+    this.internal_dispatchTaskDetail({ id, type: 'updateTaskDetail', value: optimistic });
+
+    await runMutation(this.#set, this.#get, {
+      mutate: () => taskService.update(id, data),
+      name: 'updateTask',
+      // Rollback is a server-truth refetch (not a local snapshot), so the
+      // optimistic dispatch above is reconciled from the source of record.
+      onError: async (error) => {
+        await refreshPatchedTargets();
+        saveToast(error, { retry: () => void this.#get().updateTask(id, data) });
+      },
+      setStatus: (status) => this.#get().internal_setTaskSaveStatus(id, status),
+    });
+
+    if (assigneeAgentId !== undefined || data.parentTaskId !== undefined) {
+      await Promise.all([this.#get().refreshTaskList(), refreshPatchedTargets()]).catch(() => {});
     }
   };
 
@@ -278,13 +341,24 @@ export class TaskDetailSliceActionImpl {
     });
 
     return useClientDataSWR(
-      taskId ? [FETCH_TASK_DETAIL_KEY, taskId] : null,
+      taskId ? taskKeys.detail(taskId) : null,
       async ([, id]: [string, string]) => this.fetchTaskDetail(id),
       { refreshInterval: shouldPoll ? TASK_DETAIL_POLL_INTERVAL : 0 },
     );
   };
 
   // ── Internal Actions ──
+
+  // Write the save status for a single task id. Keyed per task so a `failed`
+  // status stays with its task and never bleeds into another task's header after
+  // navigation. Shared by every runMutation-based write across the task slices.
+  internal_setTaskSaveStatus = (id: string, status: SaveStatus): void => {
+    this.#set(
+      { taskSaveStatusMap: { ...this.#get().taskSaveStatusMap, [id]: status } },
+      false,
+      `setTaskSaveStatus/${status}`,
+    );
+  };
 
   internal_dispatchTaskDetail = (payload: TaskDetailDispatch): void => {
     const currentMap = this.#get().taskDetailMap;
@@ -296,7 +370,7 @@ export class TaskDetailSliceActionImpl {
   };
 
   internal_refreshTaskDetail = async (id: string): Promise<void> => {
-    await mutate([FETCH_TASK_DETAIL_KEY, id]);
+    await mutate(taskKeys.detail(id));
   };
 }
 
