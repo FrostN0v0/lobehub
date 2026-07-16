@@ -1,9 +1,5 @@
 import type { ModelParamsSchema } from '../standard-parameters';
 
-// GPT Image edits accept up to 16 source images.
-// https://developers.openai.com/api/reference/resources/images#post-images-edits
-const GPT_IMAGE_MAX_REFERENCE_IMAGES = 16;
-
 const NANO_BANANA_ASPECT_RATIOS = [
   'auto',
   '1:1', // 1024x1024 / 2048x2048 / 4096x4096
@@ -21,11 +17,7 @@ const NANO_BANANA_ASPECT_RATIOS = [
 const NANO_BANANA_2_ASPECT_RATIOS = [...NANO_BANANA_ASPECT_RATIOS, '1:4', '4:1', '1:8', '8:1'];
 
 export const gptImage1Schema: ModelParamsSchema = {
-  imageUrls: {
-    default: [],
-    maxCount: GPT_IMAGE_MAX_REFERENCE_IMAGES,
-    maxFileSize: 5 * 1024 * 1024,
-  },
+  imageUrls: { default: [], maxCount: 1, maxFileSize: 5 * 1024 * 1024 },
   prompt: { default: '' },
   size: {
     default: 'auto',
@@ -34,11 +26,7 @@ export const gptImage1Schema: ModelParamsSchema = {
 };
 
 export const gptImage2Schema: ModelParamsSchema = {
-  imageUrls: {
-    default: [],
-    maxCount: GPT_IMAGE_MAX_REFERENCE_IMAGES,
-    maxFileSize: 5 * 1024 * 1024,
-  },
+  imageUrls: { default: [], maxCount: 1, maxFileSize: 5 * 1024 * 1024 },
   prompt: { default: '' },
   size: {
     default: 'auto',
