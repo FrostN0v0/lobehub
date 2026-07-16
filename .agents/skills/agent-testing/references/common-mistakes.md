@@ -154,7 +154,7 @@ isolated dev instance that loads live code — `electron-dev.sh start <id>` runs
 changes. Prove it's live by MEASURING a known-changed value (e.g. computed
 `::before` inset 10px vs old 28px) before trusting any screenshot. Don't kill the
 user's resident 9222 app — use a pool id. Also: `agent-browser open` mangles
-`app://` → `https://app//…` (ERR\_CONNECTION\_CLOSED); navigate inside the SPA by
+`app://` → `https://app//…` (ERR_CONNECTION_CLOSED); navigate inside the SPA by
 clicking its own `<a href>` links, not `open`.
 
 ## Case 7 — Embedding a local-path screenshot in the chat reply (broken-image placeholder)
@@ -394,3 +394,26 @@ live branch, measure the target URL/bundle, and use that path if it renders curr
 code. Only keep a harness as supporting evidence; the primary UI evidence must come
 from the product surface, or the report must clearly fail/block after every known
 path is measured.
+
+---
+
+## Case 17 — Accepting a deployment from health checks and the unauthenticated shell
+
+**Wrong approach**: after replacing a production web build, treating a green server
+health endpoint plus a rendered sign-in page as sufficient acceptance, without
+opening the authenticated SPA and waiting for real workspace content.
+
+**Why it's wrong**: server routes and the auth shell can stay healthy while the
+authenticated client bundle fails during module initialization. The user then sees
+only the product loading animation even though every backend health probe is green.
+
+**What it breaks**: a build is declared healthy and left serving traffic while the
+primary signed-in product surface is unusable.
+
+**Correct approach**: before cutover, run the exact candidate build on an isolated
+origin with the production-compatible asset set, authenticate it, and capture browser
+`pageerror`, failed-request, and screenshot evidence from the real workspace. After
+cutover, repeat the authenticated smoke test against production and assert actual
+workspace DOM content—not merely a title, splash screen, or health response. Avoid
+rebuilding unrelated SPA assets for a server-only change when a verified stable asset
+set can be reused.

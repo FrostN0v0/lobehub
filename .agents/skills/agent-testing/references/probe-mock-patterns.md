@@ -168,10 +168,10 @@
      await c.loadMoreAgentTopicsView(); // hits the injected getTopics(current>0) throw
      // → real catch sets agentTopicsViewMap[key].loadMoreError → inline AsyncError row renders
      ```
-  Pair the service injection (A4, throw only when `params.current > 0` so page-1 loads
-  and page-2 fails) with a **call counter** to prove the observer gate does NOT loop:
-  `(globalThis).__loadMoreCalls = (…||0)+1` inside the throw; after the failure, wait a
-  few seconds and assert `window.__loadMoreCalls` stays `1` (no runaway re-trigger).
+     Pair the service injection (A4, throw only when `params.current > 0` so page-1 loads
+     and page-2 fails) with a **call counter** to prove the observer gate does NOT loop:
+     `(globalThis).__loadMoreCalls = (…||0)+1` inside the throw; after the failure, wait a
+     few seconds and assert `window.__loadMoreCalls` stays `1` (no runaway re-trigger).
 - **Caveat**: calling the action directly proves the render + the real error code path +
   no-runaway, but NOT the observer's `!loadMoreError` gate under real scroll (the gate
   lives in the component's IntersectionObserver callback). To exercise the gate live you
@@ -388,7 +388,7 @@
   ASLEEP and when the window is MINIMIZED/occluded** (Chromium forces a compositor
   frame). Use it for Electron evidence and as a preflight (`--check` → exit 0 iff a
   real, non-black frame was captured). Needs repo `node_modules/ws` (resolved via
-  NODE\_PATH by the wrapper).
+  NODE_PATH by the wrapper).
 - **D10. OS `screencapture` is BLACK when the display is asleep/locked/screensaver.**
   Distinct from D8/D9: `screencapture` (and `capture-app-window.sh`, osascript
   grabs) captures the physical framebuffer, so an idle-slept display → a uniformly
@@ -476,7 +476,7 @@
   - **Postgres**: local brew Postgres 17 (pgvector available). The only paradedb-specific
     migrations are `0090_enable_pg_search` / `0093_add_bm25_indexes_with_icu` — no-op them
     in the worktree (`SELECT 1;`), everything else applies clean.
-  - **Redis is a hard dependency of Better Auth sign-in** — with a dead REDIS\_URL the seed
+  - **Redis is a hard dependency of Better Auth sign-in** — with a dead REDIS_URL the seed
     login 500s (`[Better Auth]: Error: Connection is closed`). `brew install redis`,
     `redis-server --port 6380 --daemonize yes`.
   - **S3**: `s3rver` (npm) on 29000 with a CORS config for the bucket. Its presigned-URL
@@ -515,3 +515,36 @@
 - With `http_proxy`/`HTTP_PROXY` set, `curl http://localhost:<port>` returns the
   proxy's 502 instead of connection-refused, faking a "server up but broken" signal.
   Always `curl --noproxy '*'` for local port probes.
+
+### E8. Windows `.next` junctions can create false `MODULE_NOT_FOUND` failures
+
+- **Situation**: replaying a captured Next.js production build from an isolated
+  Windows worktree while mounting `.next` as an NTFS junction whose target lives
+  outside the runtime project root.
+- **Doesn't work**: starting Next directly against the junction. Node resolves
+  externals from the target's real path, so packages available under the worktree's
+  `node_modules` can appear missing (for example Next runtime externals or database
+  drivers), producing a false diagnosis of a broken build.
+- **Works**: copy the captured `.next` tree into the isolated runtime root, then start
+  Next there. Static asset directories may remain junctioned; the server bundle that
+  resolves Node modules must live physically beneath the runtime root.
+
+### D13. `networkidle2` can time out after an authenticated SPA has already rendered
+
+- **Situation**: an authenticated workspace keeps background fetches, retries, or
+  long-lived requests active during startup.
+- **Doesn't work**: treating a `networkidle2` navigation timeout as proof that the SPA
+  is still stuck on its loading screen.
+- **Works**: navigate or reload through `domcontentloaded`, then wait for a concrete
+  product-state condition (workspace text/landmark plus an opened screenshot) while
+  separately collecting `pageerror`, failed requests, and HTTP 4xx/5xx responses.
+
+### E9. Verify multi-file previews without mutating shared storage
+
+- **Situation**: a production-compatible UI smoke test must prove that multiple files
+  are accepted, but the environment shares real file storage and database state.
+- **Works**: enable Puppeteer request interception before selecting files, hold every
+  mutating `POST`/`PUT`/`PATCH`/`DELETE` request, select the files, and inspect the
+  simultaneous local `blob:` previews. Capture the screenshot, abort the held
+  requests, and disable interception. This proves the client selection/preview
+  contract without creating persistent file records.
