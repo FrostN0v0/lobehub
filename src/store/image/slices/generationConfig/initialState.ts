@@ -1,11 +1,12 @@
 import type { ModelParamsSchema, RuntimeImageGenParams } from 'model-bank';
-import { extractDefaultValues, ModelProvider } from 'model-bank';
-import { nanoBanana2Parameters } from 'model-bank/imageParameters';
+import { gptImage25Schema } from 'model-bank/imageParameters';
+import { ModelProvider } from 'model-bank/modelProvider';
+import { extractDefaultValues } from 'model-bank/standardParameters';
 
 import { DEFAULT_IMAGE_CONFIG } from '@/const/settings';
 
-export const DEFAULT_AI_IMAGE_PROVIDER = ModelProvider.Google;
-export const DEFAULT_AI_IMAGE_MODEL = 'gemini-3.1-flash-image-preview:image';
+export const DEFAULT_AI_IMAGE_PROVIDER = ModelProvider.OpenAI;
+export const DEFAULT_AI_IMAGE_MODEL = 'gpt-image-2.5-sunburst';
 
 export interface GenerationConfigState {
   parameters: RuntimeImageGenParams;
@@ -32,14 +33,14 @@ export interface GenerationConfigState {
 }
 
 export const DEFAULT_IMAGE_GENERATION_PARAMETERS: RuntimeImageGenParams =
-  extractDefaultValues(nanoBanana2Parameters);
+  extractDefaultValues(gptImage25Schema);
 
 export const initialGenerationConfigState: GenerationConfigState = {
   model: DEFAULT_AI_IMAGE_MODEL,
   provider: DEFAULT_AI_IMAGE_PROVIDER,
   imageNum: DEFAULT_IMAGE_CONFIG.defaultImageNum,
   parameters: DEFAULT_IMAGE_GENERATION_PARAMETERS,
-  parametersSchema: nanoBanana2Parameters,
+  parametersSchema: gptImage25Schema,
   isAspectRatioLocked: false,
   activeAspectRatio: null,
   uploadingImagePreviews: [],

@@ -55,6 +55,12 @@ export const gptImage2Schema: ModelParamsSchema = {
   },
 };
 
+export const gptImage25Schema: ModelParamsSchema = {
+  prompt: { default: '' },
+  quality: { default: 'low', enum: ['low'] },
+  size: { default: '1024x1024', enum: ['1024x1024'] },
+};
+
 export const nanoBananaParameters: ModelParamsSchema = {
   aspectRatio: {
     default: 'auto',
@@ -79,6 +85,18 @@ export const nanoBananaProParameters: ModelParamsSchema = {
     default: '1K',
     enum: ['1K', '2K', '4K'],
   },
+};
+
+// Nano Banana 2 Lite has no resolution control (fixed 1K output)
+export const nanoBanana2LiteParameters: ModelParamsSchema = {
+  aspectRatio: {
+    default: 'auto',
+    enum: NANO_BANANA_2_ASPECT_RATIOS,
+  },
+  imageUrls: {
+    default: [],
+  },
+  prompt: { default: '' },
 };
 
 export const nanoBanana2Parameters: ModelParamsSchema = {
