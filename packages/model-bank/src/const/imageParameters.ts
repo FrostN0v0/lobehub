@@ -56,6 +56,7 @@ export const gptImage2Schema: ModelParamsSchema = {
 };
 
 export const gptImage25Schema: ModelParamsSchema = {
+  imageUrls: gptImage2Schema.imageUrls,
   prompt: { default: '' },
   quality: { default: 'low', enum: ['low'] },
   size: { default: '1024x1024', enum: ['1024x1024'] },

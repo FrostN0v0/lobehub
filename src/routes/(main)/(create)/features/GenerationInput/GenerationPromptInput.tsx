@@ -21,6 +21,7 @@ interface GenerationPromptInputProps {
   maxRows?: number;
   minRows?: number;
   onGenerate: () => Promise<void> | void;
+  onUploadFiles?: (files: File[]) => Promise<void> | void;
   onValueChange: (value: string) => void;
   placeholder: string;
   rightActions?: ReactNode;
@@ -47,6 +48,7 @@ const GenerationPromptInput = memo<GenerationPromptInputProps>(
     value,
     onValueChange,
     onGenerate,
+    onUploadFiles,
     placeholder,
     generateLabel,
     generatingLabel,
@@ -77,6 +79,17 @@ const GenerationPromptInput = memo<GenerationPromptInputProps>(
           if (disabled) return;
 
           onValueChange(e.target.value);
+        }}
+        onPaste={(event) => {
+          if (disabled || !onUploadFiles) return;
+
+          const files = Array.from(event.clipboardData.files).filter(
+            (file) => file.type === '' || file.type.startsWith('image/'),
+          );
+          if (files.length === 0) return;
+
+          event.preventDefault();
+          void onUploadFiles(files);
         }}
       />
     );

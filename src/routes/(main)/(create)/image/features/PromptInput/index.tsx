@@ -420,6 +420,7 @@ const PromptInput = ({ showTitle = false }: PromptInputProps) => {
           </>
         }
         onGenerate={handleGenerate}
+        onUploadFiles={canDropImage ? handleUploadFiles : undefined}
         onValueChange={setValue}
       />
     </Flexbox>
